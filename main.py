@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 import datasets
@@ -11,11 +13,11 @@ class MultiHeadAttention(torch.nn.Module):
         super(MultiHeadAttention, self).__init__()
         self.WK = torch.nn.Linear(d_model, d_key * n_heads)
         self.WQ = torch.nn.Linear(d_model, d_key * n_heads)
-        self.WV = torch.nn.Linear(d_model, d_model * n_heads)
+        self.WV = torch.nn.Linear(d_model, d_key * n_heads)
         self.d_key = d_key
         self.n_heads = n_heads
         self.d_model = d_model
-        self.WO = torch.nn.Linear(d_model * n_heads, d_model)
+        self.WO = torch.nn.Linear(d_key * n_heads, d_model)
 
     def forward(self, key_input, query_input, value_input, attention_mask):
         '''
@@ -24,34 +26,49 @@ class MultiHeadAttention(torch.nn.Module):
         key_input: [batch, time1, d_model]
         query_input: [batch, time2, d_model]
         value_input: [batch, time1, d_model]
+        attention_mask: [batch, time1]
 
         :return: the same dimensions tensor as value_input
         '''
-        keys = self.WK(key_input)  # batch,time1,d_key*n_heads
-        querys = self.WQ(query_input)  # batch,time2,d_key*n_heads
-        values = self.WV(value_input)  # batch, time1, d_model*heads
+        k = self.WK(key_input)  # batch,time1,d_key*n_heads
+        q = self.WQ(query_input)  # batch,time2,d_key*n_heads
+        v = self.WV(value_input)  # batch, time1, d_model*heads
 
-        batch_size = values.shape[0]
-        querys = torch.transpose(querys, 2, 1)  # batch, d_key*heads, time2
-        querys = torch.reshape(querys, (batch_size * self.n_heads, self.d_key, -1))  # batch*heads, d_key, time2
+        batch_size = v.shape[0]
 
-        keys = torch.transpose(keys, 2, 1)  # batch, d_key*heads, time1
-        keys = torch.reshape(keys, (batch_size * self.n_heads, self.d_key, -1))  # batch*heads, d_key, time1
-        keys = torch.transpose(keys, 2, 1)  # batch*nheads, time1, d_key
+        # [batch, n_heads, time, d_key]
+        q = q.view(batch_size, -1, self.n_heads, self.d_key).transpose(2, 1)  # batch, heads, time2, d_key
+        k = k.view(batch_size, -1, self.n_heads, self.d_key).transpose(2, 1)  # batch, heads, time1, d_key
+        v = v.view(batch_size, -1, self.n_heads, self.d_key).transpose(2, 1)  # batch, heads, time1, d_key
 
-        key_query = torch.matmul(keys, querys)  # batch*nheads, time1, time2
-        attention = torch.softmax(key_query, dim=1)  # batch*nheads, time1, time2
+        scores = q @ k.transpose(-2, -1) / math.sqrt(self.d_key)  # batch, heads, time2, time1
+        if attention_mask is not None:
+            scores = scores.masked_fill(attention_mask[:, None, None, :] == 0, float('-inf'))
+        attention = torch.softmax(scores, dim=-1)  # batch, heads, time2, time1
 
-        values = torch.transpose(values, 2, 1)  # batch, d_model*heads, time1
-        values = torch.reshape(values, (batch_size * self.n_heads, self.d_model, -1))  # batch*heads, d_model, time1
+        embeddings = attention @ v  # batch, heads, time2, d_key
 
-        embeddings = torch.matmul(values, attention)  # batch*heads, d_model, time2
-
-        embeddings = torch.reshape(embeddings, (batch_size, self.n_heads, self.d_model, -1))
-        embeddings = torch.transpose(embeddings, 3, 1)  # batch, time2, d_model, heads
-        embeddings = torch.flatten(embeddings, 2)
+        embeddings = embeddings.contiguous().transpose(2, 1)  # batch, time2, d_key, heads
+        embeddings = embeddings.flatten(2)
         embeddings = self.WO(embeddings)
         return embeddings
+
+
+class PositionEncoding(nn.Module):
+    def __init__(self, max_len, d_model):
+        super(PositionEncoding, self).__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        exp_term = torch.arange(0, d_model, 2)
+        div_term = torch.exp(exp_term * (-math.log(10000) / d_model))
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x[B, T, d]
+        x = x + self.pe[:, :x.size(1), :]
+        return x
 
 
 class TransformerBlock(torch.nn.Module):
@@ -61,7 +78,7 @@ class TransformerBlock(torch.nn.Module):
         self.norm1 = torch.nn.LayerNorm(normalized_shape=d_model)
         self.norm2 = torch.nn.LayerNorm(normalized_shape=d_model)
 
-        self.ff = torch.nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
+        self.ff = torch.nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model))
 
     def forward(self, embeddings, attention_mask):
         # input [batch_size, time, emb]
@@ -71,7 +88,7 @@ class TransformerBlock(torch.nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, d_model, d_key, n_heads, n_layers, vocab_size):
+    def __init__(self, d_model, d_key, n_heads, n_layers, vocab_size, max_len):
         super().__init__()
         self.layers = nn.ModuleList([TransformerBlock(d_model
                                                       , d_key, n_heads) for _ in range(n_layers)])
@@ -79,10 +96,13 @@ class Transformer(nn.Module):
 
         self.embedder = torch.nn.Embedding(vocab_size + 2, d_model)
 
+        self.pe = PositionEncoding(max_len, d_model)
+
     def forward(self, input_dict):
         input_ids = input_dict['input_ids']
         attention_mask = input_dict['attention_mask']
         embeddings = self.embedder(input_ids)
+        embeddings = self.pe(embeddings)
         for l in self.layers:
             embeddings = l(embeddings, attention_mask)
         logits = self.fc(embeddings[:, 0])
@@ -112,21 +132,24 @@ if __name__ == "__main__":
         return output_dict
 
 
-    batch_size = 128
-    train_dataloader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate, num_workers=0)
-    val_dataloader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate, num_workers=0)
+    batch_size = 32
+    num_workers = 0
+    train_dataloader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate,
+                                  num_workers=num_workers)
+    val_dataloader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate,
+                                num_workers=num_workers)
 
     d_model = 64
-    d_key = 32
+    d_key = 16
     n_heads = 4
-    n_layers = 5
+    n_layers = 2
     epochs = 5
     print_freq = 100
     vocab_size = tokenizer.vocab_size
-    model = Transformer(d_model, d_key, n_heads, n_layers, vocab_size)
+    model = Transformer(d_model, d_key, n_heads, n_layers, vocab_size, max_len)
     model.cuda()
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+    optimizer = torch.optim.Adam(model.parameters())
 
     for epoch in range(epochs):
 
