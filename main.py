@@ -48,8 +48,8 @@ class MultiHeadAttention(torch.nn.Module):
 
         embeddings = attention @ v  # batch, heads, time2, d_key
 
-        embeddings = embeddings.contiguous().transpose(2, 1)  # batch, time2, d_key, heads
-        embeddings = embeddings.flatten(2)
+        embeddings = embeddings.transpose(2, 1)  # batch, time2, d_key, heads
+        embeddings = embeddings.contiguous().flatten(2)
         embeddings = self.WO(embeddings)
         return embeddings
 
@@ -59,15 +59,18 @@ class PositionEncoding(nn.Module):
         super(PositionEncoding, self).__init__()
         position = torch.arange(max_len).unsqueeze(1)
         exp_term = torch.arange(0, d_model, 2)
-        div_term = torch.exp(exp_term * (-math.log(10000) / d_model))
+        div_term = torch.exp(exp_term * (-math.log(10000.0) / d_model))
         pe = torch.zeros(1, max_len, d_model)
         pe[0, :, 0::2] = torch.sin(position * div_term)
         pe[0, :, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
 
+        self.dp = nn.Dropout(p=0.1)
+
     def forward(self, x):
         # x[B, T, d]
         x = x + self.pe[:, :x.size(1), :]
+        x = self.dp(x)
         return x
 
 
@@ -78,12 +81,16 @@ class TransformerBlock(torch.nn.Module):
         self.norm1 = torch.nn.LayerNorm(normalized_shape=d_model)
         self.norm2 = torch.nn.LayerNorm(normalized_shape=d_model)
 
-        self.ff = torch.nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model))
+        self.ff = torch.nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model),
+                                      nn.Dropout(p=0.1))
+
+        self.drop = nn.Dropout(p=0.1)
 
     def forward(self, embeddings, attention_mask):
         # input [batch_size, time, emb]
         outputs = self.norm1(
             self.ff(self.norm1(self.mha(embeddings, embeddings, embeddings, attention_mask) + embeddings)) + embeddings)
+        outputs = self.drop(outputs)
         return outputs
 
 
@@ -92,11 +99,13 @@ class Transformer(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([TransformerBlock(d_model
                                                       , d_key, n_heads) for _ in range(n_layers)])
-        self.fc = nn.Linear(d_model, 1)
+        self.fc = nn.Linear(d_model, 2)
 
         self.embedder = torch.nn.Embedding(vocab_size + 2, d_model)
 
         self.pe = PositionEncoding(max_len, d_model)
+        self.dp = nn.Dropout(p=0.1)
+        self.nl = nn.LayerNorm(d_model)
 
     def forward(self, input_dict):
         input_ids = input_dict['input_ids']
@@ -105,6 +114,8 @@ class Transformer(nn.Module):
         embeddings = self.pe(embeddings)
         for l in self.layers:
             embeddings = l(embeddings, attention_mask)
+        embeddings = self.nl(embeddings)
+        embeddings = self.dp(embeddings)
         logits = self.fc(embeddings[:, 0])
         return logits
 
@@ -115,7 +126,7 @@ if __name__ == "__main__":
     train_ds = ds['train']
     val_ds = ds['validation']
 
-    max_len = 510
+    max_len = 40
     tokenizer = AutoTokenizer.from_pretrained('bert-base-cased')
 
 
@@ -148,7 +159,7 @@ if __name__ == "__main__":
     vocab_size = tokenizer.vocab_size
     model = Transformer(d_model, d_key, n_heads, n_layers, vocab_size, max_len)
     model.cuda()
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters())
 
     for epoch in range(epochs):
@@ -157,9 +168,9 @@ if __name__ == "__main__":
         for i, batch in enumerate(train_dataloader):
             targets = batch['labels']
             batch.pop('labels')
-            logits = model(batch)
-            loss = criterion(input=logits.squeeze(-1), target=targets.float())
             optimizer.zero_grad()
+            logits = model(batch)
+            loss = criterion(input=logits, target=targets)
             loss.backward()
             optimizer.step()
             if i % print_freq == 0:
@@ -173,10 +184,9 @@ if __name__ == "__main__":
             batch.pop('labels')
             with torch.no_grad():
                 logits = model(batch)
-            outputs = torch.sigmoid(logits)
-            outputs = outputs > 0.5
+            outputs = torch.softmax(logits, dim=-1)
+            outputs = torch.argmax(outputs, dim=-1)
             y_true.extend(targets.detach().cpu().numpy())
-            y_pred.extend(list(outputs.detach().cpu().numpy().astype(np.int).squeeze(-1)))
+            y_pred.extend(list(outputs.detach().cpu().numpy().astype(np.int)))
         val_acc = np.mean(np.equal(y_pred, y_true))
-        print(f' epoch={epoch} acc={val_acc}')
         print(f' epoch={epoch} acc={val_acc}')
