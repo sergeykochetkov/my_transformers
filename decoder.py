@@ -6,7 +6,7 @@ import datasets
 from torch.utils.data import DataLoader
 import numpy as np
 from transformers import AutoTokenizer
-
+from sklearn.metrics import average_precision_score
 from main import TransformerBlock, PositionEncoding
 
 
@@ -39,15 +39,16 @@ class CasualSelfAttention(nn.Module):
 
         attn_scores = keys @ queries.transpose(2, 3) / math.sqrt(self.d_key)  # batch n_head time time
 
-        attn_scores.masked_fill(self.casual_mask[:, :, :time, :time] == 0, float('-inf'))
-        if pad_mask:
+        casual_mask = self.casual_mask[:, :, :time, :time].to(attn_scores.device)
+        attn_scores.masked_fill(casual_mask == 0, float('-inf'))
+        if pad_mask is not None:
             attn_scores.masked_fill(pad_mask[:, None, None, :] == 0, float('-inf'))
 
         attn = torch.softmax(attn_scores, dim=-1)
 
         context_emb = attn @ values  # batch n_head time time @ batch n_head time d_key = batch n_head time d_key
 
-        context_emb = context_emb.transpose(1, 2).contiguous().vew(batch_size, time, -1)  # batch n_head time d_key
+        context_emb = context_emb.transpose(1, 2).contiguous().view(batch_size, time, -1)  # batch n_head time d_key
 
         context_emb = self.WO(context_emb)
         return context_emb
@@ -71,7 +72,7 @@ class Decoder(nn.Module):
         embeddings = self.pe(embeddings)
         for l in self.layers:
             embeddings = l(embeddings, attention_mask)
-        embeddings = self.nl(embeddings)
+        embeddings = self.ln(embeddings)
         embeddings = self.dp(embeddings)
         logits = self.fc(embeddings)
         return logits
@@ -114,20 +115,22 @@ if __name__ == "__main__":
     epochs = 5
     print_freq = 100
     vocab_size = tokenizer.vocab_size
-    model = Transformer(d_model, d_key, n_heads, n_layers, vocab_size, max_len)
+    model = Decoder(d_model, d_key, n_heads, n_layers, max_len, vocab_size)
     model.cuda()
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     optimizer = torch.optim.Adam(model.parameters())
 
     for epoch in range(epochs):
 
         model.train()
         for i, batch in enumerate(train_dataloader):
-            targets = batch['labels']
             batch.pop('labels')
+            targets = batch['input_ids']
+            targets = torch.roll(targets, shifts=-1, dims=1)
+            targets[:, -1] = tokenizer.pad_token_id
             optimizer.zero_grad()
             logits = model(batch)
-            loss = criterion(input=logits, target=targets)
+            loss = criterion(input=logits.view(-1, vocab_size), target=targets.view(-1))
             loss.backward()
             optimizer.step()
             if i % print_freq == 0:
@@ -137,8 +140,10 @@ if __name__ == "__main__":
         y_pred = []
         model.eval()
         for batch in val_dataloader:
-            targets = batch['labels']
             batch.pop('labels')
+            targets = batch['input_ids']
+            targets = torch.roll(targets, shifts=-1, dims=1)
+            targets[:, -1] = tokenizer.pad_token_id
             with torch.no_grad():
                 logits = model(batch)
             outputs = torch.softmax(logits, dim=-1)
