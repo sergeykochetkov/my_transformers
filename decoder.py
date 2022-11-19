@@ -7,10 +7,13 @@ from torch.utils.data import DataLoader
 import numpy as np
 from transformers import AutoTokenizer
 
+from main import TransformerBlock, PositionEncoding
 
-class MultiHeadAttention(torch.nn.Module):
-    def __init__(self, d_model, d_key, n_heads):
-        super(MultiHeadAttention, self).__init__()
+
+class CasualSelfAttention(nn.Module):
+
+    def __init__(self, d_model, d_key, n_heads, max_len):
+        super().__init__()
         self.WK = torch.nn.Linear(d_model, d_key * n_heads)
         self.WQ = torch.nn.Linear(d_model, d_key * n_heads)
         self.WV = torch.nn.Linear(d_model, d_key * n_heads)
@@ -19,94 +22,47 @@ class MultiHeadAttention(torch.nn.Module):
         self.d_model = d_model
         self.WO = torch.nn.Linear(d_key * n_heads, d_model)
 
-    def forward(self, key_input, query_input, value_input, attention_mask):
+        self.casual_mask = torch.tril(torch.eye(max_len, max_len)).view(1, 1, max_len, max_len)
+
+    def forward(self, keys, queries, values, pad_mask=None):
         '''
-
-        :param
-        key_input: [batch, time1, d_model]
-        query_input: [batch, time2, d_model]
-        value_input: [batch, time1, d_model]
-        attention_mask: [batch, time1]
-
-        :return: the same dimensions tensor as value_input
+        x: batch, time, emb
+        pad_mask: [batch, time]
         '''
-        k = self.WK(key_input)  # batch,time1,d_key*n_heads
-        q = self.WQ(query_input)  # batch,time2,d_key*n_heads
-        v = self.WV(value_input)  # batch, time1, d_model*heads
+        keys = self.WK(keys)  # batch time d_key*n_head
+        queries = self.WQ(queries)
+        values = self.WV(values)
+        batch_size, time = keys.shape[:2]
+        keys = keys.view(batch_size, -1, self.n_heads, self.d_key).transpose(1, 2)  # batch n_head time d_key
+        queries = queries.view(batch_size, -1, self.n_heads, self.d_key).transpose(1, 2)  # batch n_head time d_key
+        values = values.view(batch_size, -1, self.n_heads, self.d_key).transpose(1, 2)  # batch n_head time d_key
 
-        batch_size = v.shape[0]
+        attn_scores = keys @ queries.transpose(2, 3) / math.sqrt(self.d_key)  # batch n_head time time
 
-        # [batch, n_heads, time, d_key]
-        q = q.view(batch_size, -1, self.n_heads, self.d_key).transpose(2, 1)  # batch, heads, time2, d_key
-        k = k.view(batch_size, -1, self.n_heads, self.d_key).transpose(2, 1)  # batch, heads, time1, d_key
-        v = v.view(batch_size, -1, self.n_heads, self.d_key).transpose(2, 1)  # batch, heads, time1, d_key
+        attn_scores.masked_fill(self.casual_mask[:, :, :time, :time] == 0, float('-inf'))
+        if pad_mask:
+            attn_scores.masked_fill(pad_mask[:, None, None, :] == 0, float('-inf'))
 
-        scores = q @ k.transpose(-2, -1) / math.sqrt(self.d_key)  # batch, heads, time2, time1
-        if attention_mask is not None:
-            scores = scores.masked_fill(attention_mask[:, None, None, :] == 0, float('-inf'))
-        attention = torch.softmax(scores, dim=-1)  # batch, heads, time2, time1
+        attn = torch.softmax(attn_scores, dim=-1)
 
-        embeddings = attention @ v  # batch, heads, time2, d_key
+        context_emb = attn @ values  # batch n_head time time @ batch n_head time d_key = batch n_head time d_key
 
-        embeddings = embeddings.transpose(2, 1)  # batch, time2, d_key, heads
-        embeddings = embeddings.contiguous().flatten(2)
-        embeddings = self.WO(embeddings)
-        return embeddings
+        context_emb = context_emb.transpose(1, 2).contiguous().vew(batch_size, time, -1)  # batch n_head time d_key
 
-
-class PositionEncoding(nn.Module):
-    def __init__(self, max_len, d_model):
-        super(PositionEncoding, self).__init__()
-        position = torch.arange(max_len).unsqueeze(1)
-        exp_term = torch.arange(0, d_model, 2)
-        div_term = torch.exp(exp_term * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(1, max_len, d_model)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-
-        self.dp = nn.Dropout(p=0.1)
-
-    def forward(self, x):
-        # x[B, T, d]
-        x = x + self.pe[:, :x.size(1), :]
-        x = self.dp(x)
-        return x
+        context_emb = self.WO(context_emb)
+        return context_emb
 
 
-class TransformerBlock(torch.nn.Module):
-    def __init__(self, d_model, attn):
-        super(TransformerBlock, self).__init__()
-        self.mha = attn
-
-        self.norm1 = torch.nn.LayerNorm(normalized_shape=d_model)
-        self.norm2 = torch.nn.LayerNorm(normalized_shape=d_model)
-
-        self.ff = torch.nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model),
-                                      nn.Dropout(p=0.1))
-
-        self.drop = nn.Dropout(p=0.1)
-
-    def forward(self, embeddings, attention_mask):
-        # input [batch_size, time, emb]
-        outputs = self.norm1(
-            self.ff(self.norm1(self.mha(embeddings, embeddings, embeddings, attention_mask) + embeddings)) + embeddings)
-        outputs = self.drop(outputs)
-        return outputs
-
-
-class Transformer(nn.Module):
-    def __init__(self, d_model, d_key, n_heads, n_layers, vocab_size, max_len):
+class Decoder(nn.Module):
+    def __init__(self, d_model, d_key, n_heads, n_layers, max_len, vocab_size):
         super().__init__()
         self.layers = nn.ModuleList(
-            [TransformerBlock(d_model, MultiHeadAttention(d_model, d_key, n_heads)) for _ in range(n_layers)])
-        self.fc = nn.Linear(d_model, 2)
-
-        self.embedder = torch.nn.Embedding(vocab_size + 2, d_model)
-
+            [TransformerBlock(d_model, CasualSelfAttention(d_model, d_key, n_heads, max_len)) for _ in range(n_layers)])
+        self.embedder = nn.Embedding(vocab_size, d_model)
         self.pe = PositionEncoding(max_len, d_model)
+        self.ln = nn.LayerNorm(d_model)
         self.dp = nn.Dropout(p=0.1)
-        self.nl = nn.LayerNorm(d_model)
+        self.fc = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, vocab_size))
 
     def forward(self, input_dict):
         input_ids = input_dict['input_ids']
@@ -117,7 +73,7 @@ class Transformer(nn.Module):
             embeddings = l(embeddings, attention_mask)
         embeddings = self.nl(embeddings)
         embeddings = self.dp(embeddings)
-        logits = self.fc(embeddings[:, 0])
+        logits = self.fc(embeddings)
         return logits
 
 
